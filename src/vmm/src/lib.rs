@@ -280,7 +280,7 @@ pub enum RestoreVcpusError {
 
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
-    events_observer: Option<Box<dyn VmmEventsObserver>>,
+    events_observer: Option<Box<dyn VmmEventsObserver + Send>>,
     instance_info: InstanceInfo,
     shutdown_exit_code: Option<FcExitCode>,
 
