@@ -10,24 +10,22 @@ mod metrics;
 
 use std::fs::{self, File};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::{io, panic, process};
 
-use event_manager::SubscriberOps;
-use logger::{error, info, ProcessTimeReporter, StoreMetric, LOGGER, METRICS};
+use firecracker::run_without_api;
+use logger::{error, ProcessTimeReporter, StoreMetric, LOGGER, METRICS};
 use seccompiler::BpfThreadMap;
 use snapshot::Snapshot;
 use utils::arg_parser::{ArgParser, Argument};
 use utils::terminal::Terminal;
 use utils::validators::validate_instance_id;
-use vmm::resources::VmResources;
 use vmm::seccomp_filters::{get_filters, SeccompConfig};
 use vmm::signal_handler::register_signal_handlers;
 use vmm::version_map::{FC_VERSION_TO_SNAP_VERSION, VERSION_MAP};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::logger::{init_logger, LoggerConfig, LoggerLevel};
 use vmm::vmm_config::metrics::{init_metrics, MetricsConfig};
-use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
+use vmm::{FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
 
 // The reason we place default API socket under /run is that API socket is a
 // runtime file.
@@ -385,7 +383,7 @@ fn main_exitable() -> FcExitCode {
 
         let process_time_reporter =
             ProcessTimeReporter::new(start_time_us, start_time_cpu_us, parent_cpu_time_us);
-        api_server_adapter::run_with_api(
+        firecracker::run_with_api(
             &mut seccomp_filters,
             vmm_config_json,
             bind_path,
@@ -478,86 +476,4 @@ fn print_snapshot_data_format(snapshot_path: &str) {
             )) as i32);
         });
     println!("v{}", key);
-}
-
-// Configure and start a microVM as described by the command-line JSON.
-fn build_microvm_from_json(
-    seccomp_filters: &BpfThreadMap,
-    event_manager: &mut EventManager,
-    config_json: String,
-    instance_info: InstanceInfo,
-    boot_timer_enabled: bool,
-    mmds_size_limit: usize,
-    metadata_json: Option<&str>,
-) -> std::result::Result<(VmResources, Arc<Mutex<vmm::Vmm>>), FcExitCode> {
-    let mut vm_resources =
-        VmResources::from_json(&config_json, &instance_info, mmds_size_limit, metadata_json)
-            .map_err(|err| {
-                error!("Configuration for VMM from one single json failed: {}", err);
-                vmm::FcExitCode::BadConfiguration
-            })?;
-    vm_resources.boot_timer = boot_timer_enabled;
-    let vmm = vmm::builder::build_microvm_for_boot(
-        &instance_info,
-        &vm_resources,
-        event_manager,
-        seccomp_filters,
-    )
-    .map_err(|err| {
-        error!(
-            "Building VMM configured from cmdline json failed: {:?}",
-            err
-        );
-        vmm::FcExitCode::BadConfiguration
-    })?;
-    info!("Successfully started microvm that was configured from one single json");
-
-    Ok((vm_resources, vmm))
-}
-
-fn run_without_api(
-    seccomp_filters: &BpfThreadMap,
-    config_json: Option<String>,
-    instance_info: InstanceInfo,
-    bool_timer_enabled: bool,
-    mmds_size_limit: usize,
-    metadata_json: Option<&str>,
-) -> FcExitCode {
-    let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-
-    // Create the firecracker metrics object responsible for periodically printing metrics.
-    let firecracker_metrics = Arc::new(Mutex::new(metrics::PeriodicMetrics::new()));
-    event_manager.add_subscriber(firecracker_metrics.clone());
-
-    // Build the microVm. We can ignore VmResources since it's not used without api.
-    let (_, vmm) = match build_microvm_from_json(
-        seccomp_filters,
-        &mut event_manager,
-        // Safe to unwrap since '--no-api' requires this to be set.
-        config_json.unwrap(),
-        instance_info,
-        bool_timer_enabled,
-        mmds_size_limit,
-        metadata_json,
-    ) {
-        Ok((res, vmm)) => (res, vmm),
-        Err(exit_code) => return exit_code,
-    };
-
-    // Start the metrics.
-    firecracker_metrics
-        .lock()
-        .expect("Poisoned lock")
-        .start(metrics::WRITE_METRICS_PERIOD_MS);
-
-    // Run the EventManager that drives everything in the microVM.
-    loop {
-        event_manager
-            .run()
-            .expect("Failed to start the event manager");
-
-        if let Some(exit_code) = vmm.lock().unwrap().shutdown_exit_code() {
-            return exit_code;
-        }
-    }
 }
